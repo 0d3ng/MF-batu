@@ -7,6 +7,8 @@
 #include <BH1750.h>
 #include <WiFi.h>
 #include <ModbusMaster.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
 
 // DHT Sensor
 #define DHTPIN 23
@@ -49,9 +51,10 @@ const char* brokerHost = "54.196.58.97";
 const char* topicBHT = "farm/bht";
 const char* topicNpk1 = "farm/npk1";
 const char* topicNpk2 = "farm/npk2";
+const char* topic_data = "farm/sensor/data";
 
-const char* topicRelay1 = "relay1"; //valve air
-const char* topicRelay2 = "relay2"; //valve nutrisi
+const char* topicRelay1 = "relay1";  //valve air
+const char* topicRelay2 = "relay2";  //valve nutrisi
 const char* topicRelay3 = "relay3";
 const char* topicRelay4 = "relay4";
 const char* topicRelay5 = "relay5";
@@ -82,6 +85,12 @@ BlockNot timer10Detik(10000);
 BlockNot timer3Detik(3000);
 
 bool statusGantian = true;
+
+final static int DELAY = 2000;
+
+// Time NTP 
+WiFiUDP ntpUDP; 
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000); // GMT+7 untuk JST, pembaruan setiap 60 detik
 
 // Pre and post transmission for Modbus communication
 void preTransmission() {
@@ -144,41 +153,34 @@ void setup() {
   pinMode(RELAY5, OUTPUT);
   pinMode(RELAY6, OUTPUT);
   turnOffRelays();  // Ensure all relays are OFF initially
+
+  timeClient.begin();
 }
 
 
 void loop() {
+  timeClient.update();
+
   if (!client.connected()) {
     reconnect();
   }
   client.loop();
+  timer10Detik.update()
 
   // Read sensor data
   readDHT();
   readLight();
-  if (timer3Detik.TRIGGERED) {
-    readNPK(sensor1, "Sensor 1", sensor1Data);
-    readNPK(sensor2, "Sensor 2", sensor2Data);
-  }
 
-  // Publish sensor data every 30 seconds
-  if (timer30Detik.TRIGGERED) {
-    publishData();
-    publishDataNPK("Sensor 1", topicNpk1, sensor1Data); // publish data npk1
-    publishDataNPK("Sensor 2", topicNpk2, sensor2Data); // publish data npk1
-  }
-
-  if (timer5Detik.TRIGGERED) {
+  if (timer10Detik.TRIGGERED) {
+    publishAllData()
     lcd.clear();
     updateLCD();
     npkLCD(1, sensor1Data);
-  }
-
-  if (timer10Detik.TRIGGERED) {
-    lcd.clear();
-    updateLCD();
     npkLCD(2, sensor2Data);
+    timer10Detik.reset();
   }
+  //create delay for next read dht and light
+  delay(DELAY);
 }
 
 // Read data from DHT sensor
@@ -254,173 +256,210 @@ void publishData() {
   client.publish(topicBHT, buffer, n);
 }
 
-void publishDataNPK(const char* sensorName, const char* topic, uint16_t* data) {
-  StaticJsonDocument<200> dataNPK;
+// Publish all sensor data to MQTT broker in one JSON
+void publishAllData() {
+  DynamicJsonDocument json(1024);
+  json["viciTemperature"] = temperature;
+  json["viciHumidity"] = humidity;
+  json["viciLuminosity"] = lux;  
+  // Add NPK sensor 1 data 
+  json["npk1"]["soilHumidity"] = sensor1Data[0];
+  json["npk1"]["soilTemperature"] = sensor1Data[1];
+  json["npk1"]["soilConductivity"] = sensor1Data[2];
+  json["npk1"]["soilPh"] = sensor1Data[3];
+  json["npk1"]["soilNitrogen"] = sensor1Data[4];
+  json["npk1"]["soilPhosphorus"] = sensor1Data[5];
+  json["npk1"]["soilPotassium"] = sensor1Data[6];  
+  // Add NPK sensor 2 data 
+  json["npk2"]["soilHumidity"] = sensor2Data[0];
+  json["npk2"]["soilTemperature"] = sensor2Data[1];
+  json["npk2"]["soilConductivity"] = sensor2Data[2];
+  json["npk2"]["soilPh"] = sensor2Data[3];
+  json["npk2"]["soilNitrogen"] = sensor2Data[4];
+  json["npk2"]["soilPhosphorus"] = sensor2Data[5];
+  json["npk2"]["soilPotassium"] = sensor2Data[6];
 
-  dataNPK["npkName"] = sensorName;
-  dataNPK["soilHumidity"] = data[0];
-  dataNPK["soilTemperature"] = data[1];
-  dataNPK["soilConductivity"] = data[2];
-  dataNPK["soilPh"] = data[3];
-  dataNPK["soilNitrogen"] = data[4];
-  dataNPK["soilPhosphorus"] = data[5];
-  dataNPK["soilPotassium"] = data[6];
+  // add time information
+  time_t rawTime = timeClient.getEpochTime();
+  struct tm* timeInfo = localtime(&rawTime);
+  char formattedTime[20];
+  strftime(formattedTime, sizeof(formattedTime), "%Y-%m-%d %H:%M:%S", timeInfo);
+  json["time"] = formattedTime;
 
-  String jsonNpk;
-  serializeJson(dataNPK, jsonNpk);
-  client.publish(topic, jsonNpk.c_str());
-  Serial.print("Published data to topic: ");
-  Serial.println(topic);
-  Serial.println(jsonNpk);
+  char buffer[256];
+  size_t n = serializeJson(json, buffer);
+  client.publish(topic_data, buffer, n);
+  Serial.print("Published data: ");
+  Serial.println(buffer);
 }
 
-// Function to handle relay control via MQTT
-void callback(char* topic, byte* payload, unsigned int length) {
-  String message;
-  for (int i = 0; i < length; i++) {
-    message += (char)payload[i];
+  void publishDataNPK(const char* sensorName, const char* topic, uint16_t* data) {
+    StaticJsonDocument<200> dataNPK;
+
+    dataNPK["npkName"] = sensorName;
+    dataNPK["soilHumidity"] = data[0];
+    dataNPK["soilTemperature"] = data[1];
+    dataNPK["soilConductivity"] = data[2];
+    dataNPK["soilPh"] = data[3];
+    dataNPK["soilNitrogen"] = data[4];
+    dataNPK["soilPhosphorus"] = data[5];
+    dataNPK["soilPotassium"] = data[6];
+
+    String jsonNpk;
+    serializeJson(dataNPK, jsonNpk);
+    client.publish(topic, jsonNpk.c_str());
+    Serial.print("Published data to topic: ");
+    Serial.println(topic);
+    Serial.println(jsonNpk);
   }
 
-  if (strcmp(topic, topicRelay1) == 0) {
-    if (message == "0") {
-      digitalWrite(RELAY1, HIGH);
-    } else if (message == "1") {
-      digitalWrite(RELAY1, LOW);
+  // Function to handle relay control via MQTT
+  void callback(char* topic, byte* payload, unsigned int length) {
+    String message;
+    for (int i = 0; i < length; i++) {
+      message += (char)payload[i];
     }
-  } else if (strcmp(topic, topicRelay2) == 0) {
-    if (message == "0") {
-      digitalWrite(RELAY2, HIGH);
-    } else if (message == "1") {
-      digitalWrite(RELAY2, LOW);
-    }
-  } else if (strcmp(topic, topicRelay3) == 0) {
-    if (message == "0") {
-      digitalWrite(RELAY3, HIGH);
-    } else if (message == "1") {
-      digitalWrite(RELAY3, LOW);
-    }
-  } else if (strcmp(topic, topicRelay4) == 0) {
-    if (message == "0") {
-      digitalWrite(RELAY4, HIGH);
-    } else if (message == "1") {
-      digitalWrite(RELAY4, LOW);
-    }
-  } else if (strcmp(topic, topicRelay5) == 0) {
-    if (message == "0") {
-      digitalWrite(RELAY5, HIGH);
-    } else if (message == "1") {
-      digitalWrite(RELAY5, LOW);
-    }
-  } else if (strcmp(topic, topicRelay6) == 0) {
-    if (message == "0") {
-      digitalWrite(RELAY6, HIGH);
-    } else if (message == "1") {
-      digitalWrite(RELAY6, LOW);
-    }
-  }
-}
 
-// Connect to WiFi
-void KoneksiWIFI() {
-  Serial.print("Konek ke: ");
-  Serial.println(wifiName);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifiName, wifiPass);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println();
-  Serial.println("WiFi connected");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-}
-
-// Reconnect to MQTT broker
-void reconnect() {
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    String clientId = "SMART FARMING-";
-    clientId += String(random(0xffff), HEX);
-    if (client.connect(clientId.c_str(), brokerUser, brokerPass)) {
-      Serial.println("connected");
-      client.subscribe(topicRelay1, 0);
-      client.subscribe(topicRelay2, 0);
-      client.subscribe(topicRelay3, 0);
-      client.subscribe(topicRelay4, 0);
-      client.subscribe(topicRelay5, 0);
-      client.subscribe(topicRelay6, 0);
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      delay(5000);
+    if (strcmp(topic, topicRelay1) == 0) {
+      if (message == "0") {
+        digitalWrite(RELAY1, HIGH);
+      } else if (message == "1") {
+        digitalWrite(RELAY1, LOW);
+      }
+    } else if (strcmp(topic, topicRelay2) == 0) {
+      if (message == "0") {
+        digitalWrite(RELAY2, HIGH);
+      } else if (message == "1") {
+        digitalWrite(RELAY2, LOW);
+      }
+    } else if (strcmp(topic, topicRelay3) == 0) {
+      if (message == "0") {
+        digitalWrite(RELAY3, HIGH);
+      } else if (message == "1") {
+        digitalWrite(RELAY3, LOW);
+      }
+    } else if (strcmp(topic, topicRelay4) == 0) {
+      if (message == "0") {
+        digitalWrite(RELAY4, HIGH);
+      } else if (message == "1") {
+        digitalWrite(RELAY4, LOW);
+      }
+    } else if (strcmp(topic, topicRelay5) == 0) {
+      if (message == "0") {
+        digitalWrite(RELAY5, HIGH);
+      } else if (message == "1") {
+        digitalWrite(RELAY5, LOW);
+      }
+    } else if (strcmp(topic, topicRelay6) == 0) {
+      if (message == "0") {
+        digitalWrite(RELAY6, HIGH);
+      } else if (message == "1") {
+        digitalWrite(RELAY6, LOW);
+      }
     }
   }
-}
 
-// Turn off all relays
-void turnOffRelays() {
-  digitalWrite(RELAY1, HIGH);
-  digitalWrite(RELAY2, HIGH);
-  digitalWrite(RELAY3, HIGH);
-  digitalWrite(RELAY4, HIGH);
-  digitalWrite(RELAY5, HIGH);
-  digitalWrite(RELAY6, HIGH);
-}
+  // Connect to WiFi
+  void KoneksiWIFI() {
+    Serial.print("Konek ke: ");
+    Serial.println(wifiName);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiName, wifiPass);
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
 
-// Read NPK sensor data
-void readNPK(ModbusMaster &sensor, const char* sensorName, uint16_t* data) {
-  uint8_t result = sensor.readHoldingRegisters(0x0000, 7);
-
-  if (result == sensor.ku8MBSuccess) {
-    data[0] = sensor.getResponseBuffer(0x00);  // Humidity
-    data[1] = sensor.getResponseBuffer(0x01);  // Temperature
-    data[2] = sensor.getResponseBuffer(0x02);  // Conductivity
-    data[3] = sensor.getResponseBuffer(0x03);  // PH
-    data[4] = sensor.getResponseBuffer(0x04);  // Nitrogen (N)
-    data[5] = sensor.getResponseBuffer(0x05);  // Phosphorus (P)
-    data[6] = sensor.getResponseBuffer(0x06);  // Potassium (K)
-
-    Serial.print(sensorName);
-    Serial.print(" - Soil Humidity: ");
-    Serial.print(data[0] * 0.1);
-    Serial.println(" %RH");
-
-    Serial.print(sensorName);
-    Serial.print(" - Soil Temperature: ");
-    Serial.print(data[1] * 0.1);
-    Serial.println(" °C");
-
-    Serial.print(sensorName);
-    Serial.print(" - Soil Conductivity: ");
-    Serial.print(data[2]);
-    Serial.println(" us/cm");
-
-    Serial.print(sensorName);
-    Serial.print(" - Soil PH: ");
-    Serial.print(data[3] * 0.1);
     Serial.println();
-
-    Serial.print(sensorName);
-    Serial.print(" - Nitrogen (N): ");
-    Serial.print(data[4]);
-    Serial.println(" mg/kg");
-
-    Serial.print(sensorName);
-    Serial.print(" - Phosphorus (P): ");
-    Serial.print(data[5]);
-    Serial.println(" mg/kg");
-
-    Serial.print(sensorName);
-    Serial.print(" - Potassium (K): ");
-    Serial.print(data[6]);
-    Serial.println(" mg/kg");
-
-  } else {
-    Serial.print(sensorName);
-    Serial.print(" - Failed to read sensor data, Error code: ");
-    Serial.println(result);
+    Serial.println("WiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
   }
-}
+
+  // Reconnect to MQTT broker
+  void reconnect() {
+    while (!client.connected()) {
+      Serial.print("Attempting MQTT connection...");
+      String clientId = "SMART FARMING-";
+      clientId += String(random(0xffff), HEX);
+      if (client.connect(clientId.c_str(), brokerUser, brokerPass)) {
+        Serial.println("connected");
+        client.subscribe(topicRelay1, 0);
+        client.subscribe(topicRelay2, 0);
+        client.subscribe(topicRelay3, 0);
+        client.subscribe(topicRelay4, 0);
+        client.subscribe(topicRelay5, 0);
+        client.subscribe(topicRelay6, 0);
+      } else {
+        Serial.print("failed, rc=");
+        Serial.print(client.state());
+        Serial.println(" try again in 5 seconds");
+        delay(5000);
+      }
+    }
+  }
+
+  // Turn off all relays
+  void turnOffRelays() {
+    digitalWrite(RELAY1, HIGH);
+    digitalWrite(RELAY2, HIGH);
+    digitalWrite(RELAY3, HIGH);
+    digitalWrite(RELAY4, HIGH);
+    digitalWrite(RELAY5, HIGH);
+    digitalWrite(RELAY6, HIGH);
+  }
+
+  // Read NPK sensor data
+  void readNPK(ModbusMaster & sensor, const char* sensorName, uint16_t* data) {
+    uint8_t result = sensor.readHoldingRegisters(0x0000, 7);
+
+    if (result == sensor.ku8MBSuccess) {
+      data[0] = sensor.getResponseBuffer(0x00);  // Humidity
+      data[1] = sensor.getResponseBuffer(0x01);  // Temperature
+      data[2] = sensor.getResponseBuffer(0x02);  // Conductivity
+      data[3] = sensor.getResponseBuffer(0x03);  // PH
+      data[4] = sensor.getResponseBuffer(0x04);  // Nitrogen (N)
+      data[5] = sensor.getResponseBuffer(0x05);  // Phosphorus (P)
+      data[6] = sensor.getResponseBuffer(0x06);  // Potassium (K)
+
+      Serial.print(sensorName);
+      Serial.print(" - Soil Humidity: ");
+      Serial.print(data[0] * 0.1);
+      Serial.println(" %RH");
+
+      Serial.print(sensorName);
+      Serial.print(" - Soil Temperature: ");
+      Serial.print(data[1] * 0.1);
+      Serial.println(" °C");
+
+      Serial.print(sensorName);
+      Serial.print(" - Soil Conductivity: ");
+      Serial.print(data[2]);
+      Serial.println(" us/cm");
+
+      Serial.print(sensorName);
+      Serial.print(" - Soil PH: ");
+      Serial.print(data[3] * 0.1);
+      Serial.println();
+
+      Serial.print(sensorName);
+      Serial.print(" - Nitrogen (N): ");
+      Serial.print(data[4]);
+      Serial.println(" mg/kg");
+
+      Serial.print(sensorName);
+      Serial.print(" - Phosphorus (P): ");
+      Serial.print(data[5]);
+      Serial.println(" mg/kg");
+
+      Serial.print(sensorName);
+      Serial.print(" - Potassium (K): ");
+      Serial.print(data[6]);
+      Serial.println(" mg/kg");
+
+    } else {
+      Serial.print(sensorName);
+      Serial.print(" - Failed to read sensor data, Error code: ");
+      Serial.println(result);
+    }
+  }
